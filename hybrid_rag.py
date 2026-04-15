@@ -1,4 +1,14 @@
+"""
+Hybrid RAG Pipeline
+-------------------
+Strategy: Combine dense (FAISS + nomic-embed-text) and sparse (BM25) retrieval
+          via Reciprocal Rank Fusion, then answer with llama3.2.
+
+Fix: replaced broken `langchain_classic` import with correct `langchain.retrievers`.
+"""
+
 from pathlib import Path
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -7,85 +17,89 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 PDF_PATH = "./policies/insurances.pdf"
 INDEX_DIR = "./faiss_indexes/hybrid"
 
-def format_docs(docs):
-    """Helper function to format documents for the context."""
-    return "\n\n".join(doc.page_content for doc in docs)
+PROMPT_TEMPLATE = """
+You are an expert AI assistant for Indian insurance policies.
+Answer the following question based ONLY on the provided context.
+If the answer is not in the context, say "I don't know based on the provided documents."
 
-def build_hybrid_rag():
-    """Builds a hybrid RAG pipeline using Ollama (llama3.2), FAISS, and BM25."""
-    # 1. Load and Chunk Document (used by BM25, and by FAISS if cache is missing)
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+
+def _load_and_split() -> list:
     loader = PyPDFLoader(PDF_PATH)
     documents = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
-    splits = text_splitter.split_documents(documents)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=2500, chunk_overlap=200)
+    return splitter.split_documents(documents)
 
-    # 2. Initialize Retrievers
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+def _load_or_build_vectorstore(splits, embeddings: OllamaEmbeddings) -> FAISS:
     if Path(INDEX_DIR).exists():
-        faiss_vectorstore = FAISS.load_local(
-            INDEX_DIR,
-            embeddings,
-            allow_dangerous_deserialization=True,
+        return FAISS.load_local(
+            INDEX_DIR, embeddings, allow_dangerous_deserialization=True
         )
-    else:
-        try:
-            faiss_vectorstore = FAISS.from_documents(documents=splits, embedding=embeddings)
-        except Exception as exc:
-            raise RuntimeError(
-                "Failed to build embeddings. Embedding service may be unavailable. "
-                "Ensure Ollama is running with nomic-embed-text model."
-            ) from exc
-        Path(INDEX_DIR).parent.mkdir(parents=True, exist_ok=True)
-        faiss_vectorstore.save_local(INDEX_DIR)
-    
-    faiss_retriever = faiss_vectorstore.as_retriever(search_kwargs={"k": 5})
+    try:
+        vs = FAISS.from_documents(documents=splits, embedding=embeddings)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to build embeddings — is Ollama running with nomic-embed-text?"
+        ) from exc
+    Path(INDEX_DIR).mkdir(parents=True, exist_ok=True)
+    vs.save_local(INDEX_DIR)
+    return vs
+
+
+def build_hybrid_rag():
+    """
+    Returns a callable: question -> {"answer": str, "contexts": list[str]}
+    """
+    splits = _load_and_split()
+
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    faiss_vs = _load_or_build_vectorstore(splits, embeddings)
+
+    faiss_retriever = faiss_vs.as_retriever(search_kwargs={"k": 5})
+
     bm25_retriever = BM25Retriever.from_documents(splits)
     bm25_retriever.k = 5
 
-    # 3. Initialize Ensemble Retriever
+    # EnsembleRetriever does Reciprocal Rank Fusion (RRF) by default
     ensemble_retriever = EnsembleRetriever(
         retrievers=[bm25_retriever, faiss_retriever],
-        weights=[0.5, 0.5]
+        weights=[0.5, 0.5],
     )
 
-    # 4. Define Prompt and LLM
-    template = """
-    You are an expert AI assistant for Indian insurance policies.
-    Answer the following question based only on the provided context.
-    If the answer is not in the context, state that you don't know.
-
-    Context:
-    {context}
-
-    Question:
-    {question}
-
-    Answer:
-    """
-    prompt = ChatPromptTemplate.from_template(template)
+    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     llm = ChatOllama(model="llama3.2", temperature=0)
+    parser = StrOutputParser()
 
-    # 5. Build RAG Chain
-    rag_chain = (
-        {"context": ensemble_retriever | format_docs, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    def invoke(question: str) -> dict:
+        docs = ensemble_retriever.invoke(question)
+        context_str = "\n\n".join(d.page_content for d in docs)
+        answer = parser.invoke(
+            llm.invoke(prompt.invoke({"context": context_str, "question": question}))
+        )
+        return {"answer": answer, "contexts": [d.page_content for d in docs]}
 
-    return rag_chain
+    return invoke
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     print("Building Hybrid RAG pipeline...")
-    hybrid_chain = build_hybrid_rag()
-    print("Pipeline built successfully.")
-    question = "What is the waiting period for IT theft loss cover?"
-    print(f"Querying with: '{question}'")
-    response = hybrid_chain.invoke(question)
-    print("Response:")
-    print(response)
+    chain = build_hybrid_rag()
+    print("Pipeline built successfully.\n")
+    q = "What is the waiting period for IT theft loss cover?"
+    print(f"Question: {q}\n")
+    result = chain(q)
+    print("Answer:", result["answer"])
+    print(f"\nRetrieved {len(result['contexts'])} context chunks.")

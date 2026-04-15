@@ -1,0 +1,21 @@
+# Core LangChain stack
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-ollama>=0.2.0
+langchain-text-splitters>=0.3.0
+
+# Vector store
+faiss-cpu>=1.8.0
+
+# BM25 sparse retrieval
+rank-bm25>=0.2.2
+
+# PDF loading
+pypdf>=4.0.0
+
+# Dataset handling
+datasets>=2.19.0
+pandas>=2.0.0
+
+# RAGAS evaluation (v0.2+ API)
+ragas>=0.2.0
